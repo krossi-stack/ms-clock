@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Millisecond Clock</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+    user-select: none; -webkit-user-select: none; }
+  #time { font-size: 13vw; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  #ms { color: #3f3; }
+  #zone { font-size: 3vw; color: #888; margin-top: 1.5vw; }
+  #status { position: fixed; bottom: 2vw; left: 2vw; right: 2vw; text-align: center; font-size: 2vw; color: #888; }
+  #status.bad { color: #f44; }
+  #buttons { position: fixed; top: 2vw; right: 2vw; display: flex; gap: 1vw; }
+  button { font: inherit; font-size: 2vw; padding: 0.6vw 1.4vw; background: #222; color: #ccc;
+    border: 1px solid #444; border-radius: 0.6vw; }
+  #hint { position: fixed; top: 2vw; left: 2vw; font-size: 2vw; color: #555; }
+</style>
+</head>
+<body>
+  <div id="hint">Tap to go fullscreen</div>
+  <div id="buttons">
+    <button id="zoneBtn">Local</button>
+    <button id="syncBtn">Resync</button>
+  </div>
+  <div id="time"><span id="hms">--:--:--</span><span id="ms">.---</span></div>
+  <div id="zone">UTC</div>
+  <div id="status">Syncing&hellip;</div>
+
+<script>
+// Corrects the tablet's clock against Akamai's public time server, which
+// returns UTC to the millisecond. Each sample's offset is estimated assuming
+// the server read its clock halfway through the round trip, so the true error
+// is bounded by +/- half the round-trip time; the fastest of several samples
+// is kept because it has the tightest bound.
+const SERVER = 'https://time.akamai.com/?iso&ms';
+const SAMPLES = 8;
+const RESYNC_MS = 60000;
+const STALE_MS = 3 * RESYNC_MS;
+
+// Monotonic clock in epoch ms. Unlike Date.now(), it doesn't jump if the OS
+// adjusts the system clock while the page is open.
+// (Safari before 15 lacks performance.timeOrigin, so estimate it.)
+const timeOrigin = performance.timeOrigin || (Date.now() - performance.now());
+const now = () => timeOrigin + performance.now();
+
+let offset = 0;          // server time minus now(), ms
+let uncertainty = null;  // +/- ms; null until the first successful sync
+let lastSync = 0;
+let lastSyncFailed = false;
+let syncing = false;
+let useUtc = true;
+
+async function sample() {
+  const t0 = now();
+  // The random query string defeats caching. Don't use fetch's cache option:
+  // Safari can turn it into a CORS preflight, which this server doesn't answer.
+  const res = await fetch(SERVER + '&_=' + Math.random());
+  const text = (await res.text()).trim();
+  const t1 = now();
+  const server = Date.parse(text);
+  if (!res.ok || isNaN(server)) throw new Error('Bad time server response: ' + text);
+  return { rtt: t1 - t0, offset: server - (t0 + t1) / 2 };
+}
+
+async function sync() {
+  if (syncing) return;
+  syncing = true;
+  let best = null;
+  for (let i = 0; i < SAMPLES; i++) {
+    try {
+      const s = await sample();
+      if (!best || s.rtt < best.rtt) best = s;
+    } catch (e) {
+      // Keep trying the remaining samples; one dropped request shouldn't fail the sync.
+    }
+  }
+  if (best) {
+    offset = best.offset;
+    uncertainty = best.rtt / 2;
+    lastSync = now();
+  }
+  lastSyncFailed = !best;
+  syncing = false;
+  updateStatus();
+}
+
+const pad = (n, w = 2) => String(n).padStart(w, '0');
+const hmsEl = document.getElementById('hms');
+const msEl = document.getElementById('ms');
+const zoneEl = document.getElementById('zone');
+const statusEl = document.getElementById('status');
+
+function render() {
+  const d = new Date(now() + offset);
+  const h = useUtc ? d.getUTCHours() : d.getHours();
+  const m = useUtc ? d.getUTCMinutes() : d.getMinutes();
+  const s = useUtc ? d.getUTCSeconds() : d.getSeconds();
+  hmsEl.textContent = pad(h) + ':' + pad(m) + ':' + pad(s);
+  msEl.textContent = '.' + pad(d.getUTCMilliseconds(), 3);
+  requestAnimationFrame(render);
+}
+
+function updateStatus() {
+  if (uncertainty === null) {
+    statusEl.textContent = syncing
+      ? 'Syncing…'
+      : 'NOT SYNCED — showing the tablet’s own clock. Check the internet connection.';
+    statusEl.className = syncing ? '' : 'bad';
+    return;
+  }
+  const age = now() - lastSync;
+  const drift = Math.round(now() + offset - Date.now());
+  const clockNote = drift === 0 ? 'tablet clock matches'
+    : 'tablet clock is ' + Math.abs(drift) + ' ms ' + (drift > 0 ? 'slow' : 'fast');
+  let text = 'Synced to time.akamai.com ±' + Math.round(uncertainty) + ' ms · '
+    + clockNote + ' · last sync ' + Math.round(age / 1000) + ' s ago';
+  if (lastSyncFailed) text += ' · latest resync FAILED';
+  statusEl.textContent = text;
+  statusEl.className = age > STALE_MS || lastSyncFailed ? 'bad' : '';
+}
+
+let wakeLock = null;
+async function keepAwake() {
+  try {
+    if ('wakeLock' in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch (e) {
+    // Not supported (or not allowed from this page): set the tablet's auto-lock to Never instead.
+  }
+}
+
+document.getElementById('zoneBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  useUtc = !useUtc;
+  e.target.textContent = useUtc ? 'Local' : 'UTC';
+  zoneEl.textContent = useUtc ? 'UTC' : 'Local time';
+});
+
+document.getElementById('syncBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  sync();
+});
+
+document.body.addEventListener('click', () => {
+  const el = document.documentElement;
+  const fs = el.requestFullscreen || el.webkitRequestFullscreen;
+  // Older Safari's webkitRequestFullscreen can throw instead of returning a promise.
+  try { if (fs) Promise.resolve(fs.call(el)).catch(() => {}); } catch (e) {}
+  document.getElementById('hint').style.display = 'none';
+  keepAwake();
+});
+
+// Browsers may pause timers while the page is hidden, so resync on return.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') { keepAwake(); sync(); }
+});
+
+requestAnimationFrame(render);
+setInterval(updateStatus, 500);
+setInterval(sync, RESYNC_MS);
+keepAwake();
+sync();
+</script>
+</body>
+</html>
